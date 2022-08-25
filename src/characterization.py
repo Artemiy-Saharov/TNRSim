@@ -1,16 +1,20 @@
+#!/usr/bin/env python3
+
+import os
 import numpy as np
 import pandas as pd
 import pysam
 from scipy.signal import find_peaks
 from scipy.signal import peak_widths
+from scipy.optimize import curve_fit
+from scipy import cluster
 from scipy.stats import geom
 from pydtmc import MarkovChain
 import random
 from scipy.optimize import minimize
 from math import ceil
 from re import search
-import gffutils
-from Bio.Seq import reverse_complement, complement
+from Bio.Seq import complement
 from multiprocessing import Pool
 from time import perf_counter
 import sys
@@ -85,15 +89,20 @@ def get_hp_from_block(inp_hp_block):
     bam_open_file.close()
     return block_output[:-1]
 
+def estim_peak(N, p):
+    return np.sum(N*(np.cumprod(np.full(1000, 1-step*p))))
+
 parser = argparse.ArgumentParser(description='Characterization script')
 parser.add_argument('-a', '--annotation', type=str,
                     help='path to .gff3 or .gff file with genome annotation')
-parser.add_argument('-e', '--expression', type=str, help='path to output of featureCounts')
+#parser.add_argument('-e', '--expression', type=str, help='path to output of featureCounts')
 parser.add_argument('-g', '--genome', type=str, help='fasta file with genome sequences')
 parser.add_argument('-O', '--output', type=str, default='TNRSim_model.tsv', help='Output model file')
 parser.add_argument('-b', '--bam_file', type=str,
                     help='path to input bam file with reads aligned to genome, bam file must be sorted, indexed and has MD tag')
-parser.add_argument('-t', '--threads', type=int, default=2, help='Number of threads to use')
+parser.add_argument('--threads', type=int, default=2, help='Number of threads to use')
+parser.add_argument('-f', '--fragmentation_only', action='store_true',
+                    help='If this flag is specified, estimate only fragmentation probability and exit')
 args = parser.parse_args()
 
 threads_num = args.threads
@@ -109,14 +118,97 @@ else:
 ano, tran_len, exon_ano = parse_ano(ano_fname, inp_ano_format)
 
 
-hep_exp = pd.read_csv(args.expression, sep='\t', skiprows=1)
+os.system('mkdir tmp_tnrsim_files')
+
+stdout = os.system('featureCounts -T {cpu} -a {ant} -t exon -g gene_id -G {gen} --primary -L -o ./tmp_tnrsim_files/sample_exp.txt {bam}'.format(cpu=threads_num, ant=ano_fname, gen=args.genome, bam=bam_fname))
+
+
+hep_exp = pd.read_csv('./tmp_tnrsim_files/sample_exp.txt', sep='\t', skiprows=1)
+hep_exp.rename({hep_exp.columns[6]: 'counts'}, axis='columns', inplace=True)
+
 top_exp = hep_exp[hep_exp['counts'] > 300]['Geneid'].to_numpy()
 #print(exon_ano)
 #exon_df = exon_ano[exon_ano['ENSG'].isin(top_exp)].copy()
 #print(exon_df)
+
+ali = pysam.AlignmentFile(bam_fname, 'rb')
+genes_p = {}
+
+#print(set(top_exp) - set(ano['ENSG']))
+
+print('fitting fragmentation probability')
+
+for ensg in top_exp:
+    # break
+    new_isoform = False
+    len_arr = np.array([])
+    for read in ali.fetch(ano[ano['ENSG'] == ensg]['chr'].values[0], ano[ano['ENSG'] == ensg]['start'].values[0],
+                          ano[ano['ENSG'] == ensg]['end'].values[0]):
+        len_arr = np.append(len_arr, read.query_length)
+
+    try:
+        isoforms = np.array(tran_len[tran_len['ENSG'] == ensg]['Length'].values[0])
+    except:
+        continue
+    min_len = max(isoforms)
+    if min_len < 2000:
+        continue
+    # print(isoforms)
+    n_bins1 = 100
+    # print(min_len)
+    hist1, bin_edges1 = np.histogram(len_arr[((len_arr < min_len + 500) & (len_arr > 10))], bins=n_bins1)
+    bin_w1 = np.diff(bin_edges1)[0]
+    step = (min_len + 490)/n_bins1
+    # print('Mean: {}'.format(hist1.mean()))
+    peaks, _ = find_peaks(hist1, prominence=[50, 1000], width=[1, 15], distance=5)
+    # peaks, _ = find_peaks(hist1, threshold=0.1*hist1.mean(), width=[40/bin_w1, 300/bin_w1], prominence=[3, 1000])
+
+    if len(peaks) > 0:
+        min_len = bin_edges1[peaks[0]]
+        # print(peaks)
+        # print('max peak is {}'.format(bin_w1*peaks[-1]))
+    else:
+        continue
+    if bin_w1 * peaks[-1] < 1400:
+        continue
+
+    peaks_width_res = peak_widths(hist1, [peaks[-1]], rel_height=0.85)
+    popt, pcov = curve_fit(estim_peak,
+                           xdata=[0.95 * hist1[round(peaks_width_res[2][0]) - 5:round(peaks_width_res[2][0])].mean()],
+                           ydata=[1.1 * hist1[round(peaks_width_res[2][0]):round(peaks_width_res[3][0])].sum()],
+                           p0=[0.0004])
+    estimated_p = float(*popt)
+    zero_N = hist1[round(peaks_width_res[2][0]) - 5:round(peaks_width_res[2][0])].mean() / (
+                (1 - (estimated_p * step)) ** round(peaks_width_res[2][0]))
+    genes_p.update({ensg: estimated_p})
+
+ali.close()
+
+
+clust_res = cluster.vq.kmeans2(list(genes_p.values()), k=3, iter=5000, minit='points')
+cls, num_points = np.unique(clust_res[1], return_counts=True)
+cls = np.delete(cls, np.argmin(num_points))
+num_points = np.delete(num_points, np.argmin(num_points))
+frag_p = 0
+for cl, cl_weigth in zip(cls, num_points):
+    frag_p += clust_res[0][cl]*(cl_weigth**2)
+frag_p = frag_p/np.square(num_points).sum()
+
+if args.fragmentation_only:
+    print('Characterization is completed, fragmentation probability is {}'.format(round(frag_p, 6)))
+    os.system('rm -r tmp_tnrsim_files')
+    sys.exit(0)
+
+
+
+
+
+
 model_dict = {}
 
-ensg = 'ENSG00000115414.21'
+print('fitting error profile')
+
+ensg = top_exp[0]
 
 ali = pysam.AlignmentFile(bam_fname, 'rb')
 len_arr = np.array([])
@@ -212,7 +304,6 @@ model_dict.update({'err_prob': list(mc.p.round(3)[0, 1:]),
                    'mis_after_ins': [float(mc.p.round(3)[2, 1])],
                    'mis_after_del': [float(mc.p.round(3)[3, 1])]})  # order is mis, ins, del
 
-ensg = 'ENSG00000084674.15'
 ali = pysam.AlignmentFile(bam_fname, mode='rb')
 ref_genome_seq = pysam.FastaFile(args.genome)
 mis_matrix = pd.DataFrame(index=['A', 'T', 'G', 'C'], columns=['A', 'T', 'G', 'C'], dtype='Int64').fillna(0)
@@ -236,7 +327,8 @@ mis_matrix= mis_matrix.apply(lambda x: x/x.sum())
 
 model_dict.update({'base_stability': list(mis_matrix.to_numpy(dtype=float).flatten())})
 
-ensg = 'ENSG00000115414.21'
+print('firring quality profile')
+
 mis_q = np.array([], dtype=np.int64)
 ali = pysam.AlignmentFile(bam_fname, 'rb')
 iters = 0
@@ -261,7 +353,6 @@ ali.close()
 mis_q_hist = list(np.histogram(mis_q[(mis_q>0)&(mis_q<41)], density=True, bins=39)[0])
 
 
-ensg = 'ENSG00000115414.21'
 ali = pysam.AlignmentFile(bam_fname, 'rb')
 len_arr = np.array([])
 low_match = 0
@@ -302,7 +393,7 @@ ali.close()
 
 ins_q_hist = list(np.histogram(ins_qual_arr[(ins_qual_arr>0)&(ins_qual_arr<41)], density=True, bins=39)[0])
 
-ensg = 'ENSG00000115414.21'
+
 ali = pysam.AlignmentFile(bam_fname, 'rb')
 homopolymers = [[], [], [], []]  # lenght of hp for A, T, G and C
 hp_starts = [[], [], [], []]
@@ -356,7 +447,6 @@ end_unalig_q_hist = list(np.histogram(short_quals[(short_quals>0)&(short_quals<3
 model_dict.update({'mis_q_distr': mis_q_hist, 'ins_q_distr':ins_q_hist,
                    'end_q_distr': end_unalig_q_hist, 'start_q_distr': start_unalig_q_hist})
 
-ensg = 'ENSG00000115414.21'
 ali = pysam.AlignmentFile(bam_fname, 'rb')
 homopolymers = [[], [], [], []]  # lenght of hp for A, T, G and C
 hp_starts = [[], [], [], []]
@@ -451,6 +541,8 @@ model_dict.update({'autoreg_specs': list(match_q_res.x)})
 
 exon_df = exon_ano[exon_ano['ENSG'].isin(top_exp)].copy()
 
+print('fitting homopolymer profile')
+
 ref_genome_seq = pysam.FastaFile(args.genome)
 iters = 0
 gene_len = 0
@@ -465,7 +557,7 @@ for chrom in set(exon_df['chr']):
         exon_seq = chr_seq[start_exon:end_exon]
         dig_seq = ''.join(map(str, seq_to_dig(exon_seq)))
         if len(dig_seq) == 0:
-            print(chrom, start_exon, end_exon)
+            #print(chrom, start_exon, end_exon)
             continue
         cur_sym = dig_seq[0]
         hp_len = 1
@@ -533,7 +625,7 @@ for j in range(4):
         #print(len(list(filter(lambda x: x>9, length_hp_list)))/(len(length_hp_list)+1), i)
         if len(length_hp_list) < 300:
             hp_distr_specs[j].append(hp_distr_specs[j][-1])
-            print('low number of reads')
+            #print('low number of reads')
             continue
         hp_len_distr_arr = np.array(length_hp_list, dtype=np.int64)
         min_res = minimize(mix_hp_distr_fit, args=(hp_len_distr_arr),
@@ -618,9 +710,12 @@ for i in range(4):
 
 model_dict.update(model_format_hp_qual)
 
-# code for fitting fragmentation probabillity here
+print('Characterization is completed, fragmentation probability is {}'.format(round(frag_p, 6)))
 
-model_dict.update({'frag_prob': 0.00045})
+model_dict.update({'frag_prob': [frag_p]})
+
+
 
 model = pd.DataFrame(model_dict.items(), columns=['params', 'values'])
 model.to_csv('full_model.tsv', index=False, sep ='\t')
+os.system('rm -r tmp_tnrsim_files')

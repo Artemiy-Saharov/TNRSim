@@ -9,8 +9,6 @@ import random
 from scipy.optimize import minimize
 from math import ceil
 from re import search
-import gffutils
-from Bio.Seq import reverse_complement, complement
 from multiprocessing import Pool
 from time import perf_counter
 import sys
