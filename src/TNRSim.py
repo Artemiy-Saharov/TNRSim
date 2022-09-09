@@ -20,6 +20,7 @@ parser.add_argument('-m', '--model', type=str, help='path to model file')
 parser.add_argument('-t', '--transcriptome', type=str, help='fasta file with transcript sequences')
 parser.add_argument('-O', '--output', type=str, default='simulated_reads.fasta', help='Output file with reads')
 parser.add_argument('--threads', type=int, default=1, help='Number of CPU cores for simulation')
+parser.add_argument('--seed', type=int, help='Set seed for random values generator', default=None)
 #parser.add_argument('--fastq', type=bool, default=False, help='if this option is specified, '
 #                                                             'simulator will simulate reads in fastq format')
 args = parser.parse_args()
@@ -113,7 +114,9 @@ else:
 
 lens = np.arange(1, 199)
 
-def simulate_fastq(transcriptome, expression_prof, fragmentation_rate, filename):
+def simulate_fastq(transcriptome, expression_prof, fragmentation_rate, filename, seed):
+    random.seed(seed)
+    np.random.seed(seed)
     file = open(filename, 'w')
     for transcript_id in expression_prof['transcript_id']:
         seq = str(transcriptome.fetch(transcript_id))
@@ -393,8 +396,13 @@ for thread_num in range(threads):
         part_prof = exp_prof[thread_num*prof_step:].copy()
     else:
         part_prof = exp_prof[thread_num*prof_step:(thread_num+1)*prof_step].copy()
+
+    if args.seed is None:
+        input_seed = None
+    else:
+        input_seed = args.seed + thread_num
     procs.append(Process(target=simulate_fastq,
-                         args=(transcripts, part_prof, frag_prob, out_file + '.' + str(thread_num),)))
+                         args=(transcripts, part_prof, frag_prob, out_file + '.' + str(thread_num), input_seed,)))
 for i in range(threads):
     procs[i].start()
 for i in range(threads):

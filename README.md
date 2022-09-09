@@ -29,7 +29,7 @@ Optionally you could add src dir to `PATH`
 
     TNRSim.py -e TNRSim_basic_exp_prof.tsv -m dRNA_model.tsv -t transcriptome.fasta -O simulated_reads.fastq
   
-Key feature of TNRSim is imitation of reads fragmentation (simulation of truncated reads). Fragmentation probability setting is responsible for read lenght distribution (you can see example of this distribution in TNRSim logo). Fragmentation probability is estimated during library characterization and specified in model file, but also could be provided with flag -f/--fragmentation_probability (0.0004 is low fragmentation probability (good library) and 0.0015 is high (bad library)).
+Key feature of TNRSim is imitation of reads fragmentation (simulation of truncated reads). Fragmentation probability setting is responsible for read lenght distribution (you can see example of this distribution in TNRSim logo). Fragmentation probability is estimated during library characterization and specified in model file, but also could be provided with flag `-f/--fragmentation_probability` (0.0004 is low fragmentation probability (good library) and 0.0015 is high (bad library)).
 
     TNRSim.py -f 0.001 -e TNRSim_exp_prof.tsv -m dRNA_model.tsv -t transcriptome.fasta -O simulated_reads.fastq
     
