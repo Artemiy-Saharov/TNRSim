@@ -79,7 +79,9 @@ for i in range(4):
     mis_probs.append(1 - stab[i,i])
 mis_probs = np.array(mis_probs)
 mis_probs = mis_probs*(1/mis_probs.sum())
-mis_probs = mis_probs*2
+mis_porbs = np.array([1, 1, 1, 1])
+#mis_probs = mis_probs*5
+#print('mis_probs:', mis_probs)
 
 hp_qual_model_df = seq_model[seq_model['params'].str.contains('hp_spec_qual')].copy()
 hp_qual_dict = {}
