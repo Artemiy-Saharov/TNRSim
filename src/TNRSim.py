@@ -238,6 +238,12 @@ def make_errors2(tr_seq, hps, add_long_unalig):
     tr_hps = hps + tr_len
     hp_df = pd.DataFrame(tr_hps)
     tr_hps = hp_df[hp_df[0]>0].to_numpy()
+    n_deleted = 0
+    for n_homopol in range(1, len(tr_hps)):
+    	n_homopol -= n_deleted
+    	if (tr_hps[n_homopol][0]-tr_hps[n_homopol-1][1])==0:
+        	tr_hps = np.delete(tr_hps, n_homopol, axis=0)
+        	n_deleted += 1
     if tr_len < 500:
         states_number = 120
     else:
