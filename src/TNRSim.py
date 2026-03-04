@@ -1,428 +1,707 @@
 #!/usr/bin/env python3
+"""
+TNRSim Simulator — Full pipeline with robust error simulation and length synchronization
+"""
 
+import os
+import sys
 import numpy as np
 import pandas as pd
-import random
-import argparse
-from scipy.stats import skewnorm
-from scipy.stats import geom
-from multiprocessing import Process
-import os
 import pysam
+import argparse
+import random
+from scipy.stats import skewnorm, geom
+from multiprocessing import Pool, cpu_count
+import time
+
+_triangular_warnings_issued = set()
+
+def normalize_scalar(value):
+    """Convert single-element lists/arrays to scalars; preserve multi-element arrays."""
+    if isinstance(value, (list, tuple, np.ndarray)):
+        if len(value) == 1:
+            return float(value[0])
+        return [float(v) for v in value]
+    return float(value)
 
 
-parser = argparse.ArgumentParser(description='Simulator script')
-parser.add_argument('-f', '--fragmentation_probability',
-                    type=float, help='probability to get read break')
-parser.add_argument('-e', '--exp_prof', type=str,
-                    help='path to tsv file with number of reads to be simulated for each transcript')
-parser.add_argument('-m', '--model', type=str, help='path to model file')
-parser.add_argument('-t', '--transcriptome', type=str, help='fasta file with transcript sequences')
-parser.add_argument('-O', '--output', type=str, default='simulated_reads.fasta', help='Output file with reads')
-parser.add_argument('--threads', type=int, default=1, help='Number of CPU cores for simulation')
-parser.add_argument('--seed', type=int, help='Set seed for random values generator', default=None)
-#parser.add_argument('--fastq', type=bool, default=False, help='if this option is specified, '
-#                                                             'simulator will simulate reads in fastq format')
-args = parser.parse_args()
+def parse_model_value(value_str):
+    """Universal parser for TNRSim model values — handles both formats."""
+    value_str = str(value_str).strip()
 
-threads = args.threads
-transcripts = pysam.FastaFile(args.transcriptome)
-out_file = args.output
-exp_prof = pd.read_csv(args.exp_prof, sep='\t')
-seq_model = pd.read_csv(args.model, sep='\t')
+    # Special case: homopolymer specs are semicolon-delimited strings
+    if ';' in value_str and ':' in value_str and not value_str.startswith('['):
+        return value_str
 
+    # Remove brackets if present
+    if value_str.startswith('[') and value_str.endswith(']'):
+        value_str = value_str[1:-1]
 
-def fragmentation1(length, N, p_t):
-    return N*(np.cumprod(np.full(length, 1-p_t)))
+    # Split and convert to floats
+    try:
+        parts = [x.strip() for x in value_str.split(',') if x.strip()]
+        return [float(p) for p in parts]
+    except ValueError:
+        return value_str
 
 
-def weibull_geom(a, pr, weight, samp_number):
-    rand_arr = np.append(np.ceil(np.random.weibull(a, round(samp_number*weight))),
-                                 np.random.geometric(pr, round(samp_number*((1-weight)))))
-    np.random.shuffle(rand_arr)
-    return rand_arr
+def load_homopolymer_params(model_df, param_suffix):
+    """Correctly extract homopolymer parameters using ENDWITHS."""
+    hp_dict = {}
+    hp_rows = model_df[model_df['params'].str.endswith(param_suffix)]
+
+    for _, row in hp_rows.iterrows():
+        param_name = row['params']
+        base = param_name[0]
+        value_str = row['values']
+        specs = str(value_str).strip()
+
+        if specs.startswith('[') and specs.endswith(']'):
+            specs = specs[1:-1]
+
+        for spec_entry in specs.split(';'):
+            spec_entry = spec_entry.strip()
+            if not spec_entry:
+                continue
+
+            parts = spec_entry.split(':')
+
+            if param_suffix == '_hp_spec' and len(parts) >= 3:
+                try:
+                    mu = float(parts[0])
+                    sigma = float(parts[1])
+                    ref_len = int(float(parts[2]))
+                    hp_dict[f"{ref_len}{base}"] = (mu, sigma)
+                except (ValueError, IndexError):
+                    continue
+
+            elif param_suffix == '_hp_spec_qual' and len(parts) >= 4:
+                try:
+                    loc = float(parts[0])
+                    scale = float(parts[1])
+                    shape = float(parts[2])
+                    pos = int(float(parts[3]))
+                    hp_dict[f"{pos}{base}"] = (loc, scale, shape)
+                except (ValueError, IndexError):
+                    continue
+
+    return hp_dict
 
 
-def pois_geom(lam, pr, weight, samp_number):
-    rand_arr = np.append(1 + np.random.poisson(lam, round(samp_number*weight)),
-                                 np.random.geometric(pr, round(samp_number*((1-weight)))))
-    np.random.shuffle(rand_arr)
-    return rand_arr
+def validate_model(model_dict):
+    """Validate critical model parameters with type normalization."""
+    errors = []
+
+    # Normalize scalar parameters
+    for param in ['frag_prob', 'mis_after_ins', 'mis_after_del']:
+        try:
+            model_dict[param] = normalize_scalar(model_dict[param])
+        except Exception as e:
+            errors.append(f"Failed to normalize {param}: {e}")
+
+    # Check fragmentation probability
+    p = model_dict['frag_prob']
+    if not (0.0001 <= p <= 0.01):
+        errors.append(f"frag_prob={p:.6f} outside biologically plausible range [0.0001, 0.01]")
+
+    # Check distributions
+    for param in ['hist_match', 'mis_params', 'ins_params', 'del_params']:
+        if param not in model_dict:
+            errors.append(f"Missing '{param}' parameter")
+        elif not isinstance(model_dict[param], (list, tuple, np.ndarray)) or len(model_dict[param]) == 0:
+            errors.append(f"'{param}' must be a non-empty list/array")
+
+    # Check base stability matrix
+    base_stab = model_dict.get('base_stability')
+    if base_stab is None or not isinstance(base_stab, (list, tuple, np.ndarray)) or len(base_stab) != 16:
+        errors.append("base_stability must contain exactly 16 values (4x4 matrix)")
+
+    # Check autoregressive specs
+    autoreg = model_dict.get('autoreg_specs')
+    if autoreg is None or not isinstance(autoreg, (list, tuple, np.ndarray)) or len(autoreg) != 9:
+        errors.append("autoreg_specs must contain exactly 9 parameters")
+
+    # Check homopolymer dictionaries
+    for hp_dict_name in ['hp_distr_dict', 'hp_qual_dict']:
+        hp_dict = model_dict.get(hp_dict_name)
+        if hp_dict is None or not isinstance(hp_dict, dict):
+            errors.append(f"{hp_dict_name} must be a dictionary")
+
+    if errors:
+        print("\n[CRITICAL] Model validation FAILED:")
+        for err in errors:
+            print(f"  ✗ {err}")
+        sys.exit(1)
+
+    print("\n[SUCCESS] Model validation PASSED")
+    print(f"  Fragmentation probability: p = {model_dict['frag_prob']:.6f}")
+    print(f"  Match histogram bins: {len(model_dict['hist_match'])}")
+    base_stab_matrix = np.array(model_dict['base_stability']).reshape(4, 4)
+    print(f"  Base stability matrix diagonal: {[round(x,3) for x in np.diag(base_stab_matrix)]}")
+    print(f"  Homopolymer length specs: {len(model_dict['hp_distr_dict'])} entries")
+    print(f"  Homopolymer quality specs: {len(model_dict['hp_qual_dict'])} entries")
+
+
+def sanitize_triangular_params(l, c, r, min_spread=0.5):
+    """
+    Ensure l < c < r for triangular distribution with minimum spread.
+
+    triangular() requires: left < mode < right (strict inequalities)
+    This function enforces these constraints with a minimum spread.
+
+    Parameters:
+    -----------
+    l, c, r : float
+        Left, mode, right parameters
+    min_spread : float
+        Minimum distance between l-c and c-r (default: 0.5)
+
+    Returns:
+    --------
+    tuple : (l, c, r) sanitized
+    """
+    l, c, r = float(l), float(c), float(r)
+
+    # Ensure strict ordering: l < c < r
+    if c <= l:
+        c = l + min_spread
+
+    if r <= c:
+        r = c + min_spread
+
+    # Ensure minimum spread on both sides
+    if c - l < min_spread:
+        l = c - min_spread
+
+    if r - c < min_spread:
+        r = c + min_spread
+
+    # Final safety check
+    assert l < c < r, f"Triangular params invalid after sanitization: l={l}, c={c}, r={r}"
+
+    return l, c, r
+
 
 def base_to_dig(letter):
-    if letter=='A': return 0
-    if letter=='T': return 1
-    if letter=='G': return 2
-    if letter=='C': return 3
-
-def seq_to_dig(read_seq):
-    return list(map(base_to_dig, list(read_seq)))
-
-get_values = lambda param: list(map(float, seq_model[seq_model['params']==param]['values'].values[0][1:-1].split(', ')))
-
-hist_match = np.array(get_values('hist_match'))
-mis_params = np.array(get_values('mis_params'))
-del_params = np.array(get_values('del_params'))
-ins_params = np.array(get_values('ins_params'))
-err_prob = np.array(get_values('err_prob'))
-mis_after_del_prob = get_values('mis_after_del')[0]
-mis_after_ins_prob = get_values('mis_after_ins')[0]
-stab = np.array(get_values('base_stability')).reshape(4, 4)
-match_autoreg_specs = get_values('autoreg_specs')
-mis_q_distr = np.array(get_values('mis_q_distr'))
-ins_q_distr = np.array(get_values('ins_q_distr'))
-end_q_distr = np.array(get_values('end_q_distr'))
-start_q_distr = np.array(get_values('start_q_distr'))
-
-mis_probs = []
-for i in range(4):
-    mis_probs.append(1 - stab[i,i])
-mis_probs = np.array(mis_probs)
-mis_probs = mis_probs*(1/mis_probs.sum())
-mis_porbs = np.array([1, 1, 1, 1])
-#mis_probs = mis_probs*5
-#print('mis_probs:', mis_probs)
-
-hp_qual_model_df = seq_model[seq_model['params'].str.contains('hp_spec_qual')].copy()
-hp_qual_dict = {}
-for spec, value in zip(hp_qual_model_df['params'], hp_qual_model_df['values']):
-    spec_sym = spec[0]
-    #print(spec_sym)
-    hp_qual_values = list(map(lambda x: tuple((float(x.split(':')[0]),
-                                                float(x.split(':')[1]), float(x.split(':')[2]))), value[2:-2].split(';')))
-    #print(hp_distr_values)
-    for i, val in zip(range(1, 8), hp_qual_values):
-        hp_qual_dict.update({str(i)+spec[0]:val})
-
-hp_model_df = seq_model[seq_model['params'].str[1:]=='_hp_spec'].copy()
-hp_distr_dict = {}
-for spec, value in zip(hp_model_df['params'], hp_model_df['values']):
-    spec_sym = spec[0]
-    #print(spec_sym)
-    hp_distr_values = list(map(lambda x: tuple((float(x.split(':')[0]),
-                                                float(x.split(':')[1]))), value[2:-2].split(';')))
-    #print(hp_distr_values)
-    for i, val in zip(range(5, 29), hp_distr_values):
-        hp_distr_dict.update({str(i)+spec[0]:val})
+    """Convert nucleotide to digit (0=A,1=T,2=G,3=C)."""
+    mapping = {'A': 0, 'T': 1, 'G': 2, 'C': 3, 'U': 1}
+    return mapping.get(letter.upper(), -1)
 
 
+def identify_homopolymers(seq, min_length=5):
+    """Identify homopolymers in sequence. Returns [(start, end, base), ...]."""
+    hps = []
+    if len(seq) < min_length:
+        return hps
 
-if args.fragmentation_probability == None:
-    frag_prob = get_values('frag_prob')[0]
-else:
-    frag_prob = args.fragmentation_probability
+    cur_base = seq[0].upper()
+    start = 0
 
-
-
-lens = np.arange(1, 199)
-
-def simulate_fastq(transcriptome, expression_prof, fragmentation_rate, filename, seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    file = open(filename, 'w')
-    for transcript_id in expression_prof['transcript_id']:
-        seq = str(transcriptome.fetch(transcript_id))
-        len_distr = fragmentation_rate*fragmentation1(len(seq),
-                                 expression_prof[expression_prof['transcript_id']==transcript_id]['counts'].values[0],
-                                 fragmentation_rate)
-        N_full = float(expression_prof[expression_prof['transcript_id']==transcript_id]['counts'].values[0]) - np.sum(len_distr)
-        simulate_isoform_with_q(seq, len_distr, N_full, file, transcript_id, expression_prof)
-    file.close()
-
-
-def simulate_isoform_with_q(isoform_seq, len_distr, N_intact, fasta, t_id, expression_prof):
-    step_distr = 40
-    isoform_counts = expression_prof[expression_prof['transcript_id'] == t_id]['counts'].values[0]
-    isoform_len = len(isoform_seq)
-    trun_ratio = N_intact / isoform_counts
-
-    unalig_ratio = random.gauss(1.3, 0.5)
-    if unalig_ratio < 0.01:
-        unalig_ratio = 0.01
-    num_long = round(isoform_counts / (unalig_ratio + 1))
-    num_short = isoform_counts - num_long
-
-    tran_hps = []
-    bases = ['A', 'T', 'G', 'C']
-    dig_seq = ''.join(map(str, seq_to_dig(isoform_seq))) + '4'
-    cur_sym = dig_seq[0]
-    hp_len = 1
-    for base_n in range(len(dig_seq)):
-        if dig_seq[base_n] == cur_sym:
-            hp_len += 1
+    for i in range(1, len(seq) + 1):
+        if i < len(seq) and seq[i].upper() == cur_base:
+            continue
         else:
-            if hp_len > 4:
-                hp_sym = bases[int(cur_sym)]
-                tran_hps.append(str(base_n - hp_len - isoform_len)
-                                + ':' + str(base_n - isoform_len))
-            hp_len = 1
-            cur_sym = str(dig_seq[base_n])
-    tran_hps = np.array(list(map(lambda x: tuple((int(x.split(':')[0]), int(x.split(':')[1]))), tran_hps)))
-    counts = 0
-    for frag_len in range(30, len(len_distr) - step_distr, step_distr):
-        for read_number in range(round(step_distr * len_distr[frag_len])):
-            add_long_end = True if counts < num_long * (1 - trun_ratio) else False
-            nucl_seq, qual_seq = make_errors2(isoform_seq[random.randint(-step_distr - frag_len, -frag_len):],
-                                              tran_hps, add_long_end)
-            fasta.write('@' + t_id + '_read_' + str(counts) + '\n' + nucl_seq + '\n' + '+' + '\n' + qual_seq + '\n')
-            counts += 1
-    num_truncated = int(counts)
-    for read_number in range(round(N_intact)):
-        add_long_end = True if counts - num_truncated < num_long * trun_ratio else False
-        nucl_seq, qual_seq = make_errors2(isoform_seq, tran_hps, add_long_end)
-        fasta.write('@' + t_id + '_read_' + str(counts) + '\n' + nucl_seq + '\n' + '+' + '\n' + qual_seq + '\n')
-        counts += 1
+            hp_len = i - start
+            if hp_len >= min_length:
+                hps.append((start, i, cur_base))
+            if i < len(seq):
+                cur_base = seq[i].upper()
+                start = i
+
+    return hps
 
 
+def gen_qual(seg_type, inp_seg_len, model_dict, warn_once=True):
+    """
+    Generate quality string of EXACT length inp_seg_len.
+    FIX: Added strict triangular parameter sanitization (l < c < r).
 
-def gen_qual(seg_type, inp_seg_len):
-    out_q = []
-    if seg_type == 'match':
-        l1, c1, r1, l2, c2, r2, triag_weigth = match_autoreg_specs[1], match_autoreg_specs[2], match_autoreg_specs[3], match_autoreg_specs[4], match_autoreg_specs[5], match_autoreg_specs[6], match_autoreg_specs[7]
-        noise = np.append(np.random.triangular(l1, c1, r1, size=round(inp_seg_len*triag_weigth)),
-                 np.random.triangular(l2, c2, r2, size=round(inp_seg_len*(1-triag_weigth))))
+    Parameters:
+    -----------
+    warn_once : bool
+        If True, only warn once per unique parameter set to reduce spam
+    """
+    global _triangular_warnings_issued
+
+    if inp_seg_len <= 0:
+        return ''
+
+    match_autoreg_specs = model_dict['autoreg_specs']
+    mis_q_distr = np.array(model_dict['mis_q_distr'])
+    ins_q_distr = np.array(model_dict['ins_q_distr'])
+    end_q_distr = np.array(model_dict['end_q_distr'])
+    start_q_distr = np.array(model_dict['start_q_distr'])
+
+    out_q = np.zeros(inp_seg_len, dtype=np.int32)
+
+    if seg_type == 'match' and inp_seg_len >= 2:
+        # Извлекаем параметры авторегрессионной модели
+        l1, c1, r1 = match_autoreg_specs[1], match_autoreg_specs[2], match_autoreg_specs[3]
+        l2, c2, r2 = match_autoreg_specs[4], match_autoreg_specs[5], match_autoreg_specs[6]
+        triag_weight = match_autoreg_specs[7]
+        alpha = match_autoreg_specs[0]
+        offset = match_autoreg_specs[8]
+
+        # === FIX: Строгая санитизация с min_spread ===
+        l1, c1, r1 = sanitize_triangular_params(l1, c1, r1, min_spread=0.5)
+        l2, c2, r2 = sanitize_triangular_params(l2, c2, r2, min_spread=0.5)
+
+        n_noise = inp_seg_len - 1
+
+        # Ключ для отслеживания предупреждений
+        param_key = f"({l1:.2f},{c1:.2f},{r1:.2f})_({l2:.2f},{c2:.2f},{r2:.2f})"
+
+        # Генерация шума с защитой от ошибок
+        try:
+            noise1 = np.random.triangular(l1, c1, r1, size=round(n_noise * triag_weight))
+            noise2 = np.random.triangular(l2, c2, r2, size=round(n_noise * (1 - triag_weight)))
+        except ValueError as e:
+            # Предупреждаем только один раз на уникальный набор параметров
+            if warn_once and param_key not in _triangular_warnings_issued:
+                print(f"[WARNING] Triangular distribution failed: {e}. Using normal distribution fallback.")
+                print(f"  Parameters: set1=({l1:.2f},{c1:.2f},{r1:.2f}), set2=({l2:.2f},{c2:.2f},{r2:.2f})")
+                _triangular_warnings_issued.add(param_key)
+
+            # Fallback: нормальное распределение
+            noise1 = np.random.normal(c1, max(0.5, abs(r1-l1)/4), size=round(n_noise * triag_weight))
+            noise2 = np.random.normal(c2, max(0.5, abs(r2-l2)/4), size=round(n_noise * (1 - triag_weight)))
+
+        noise = np.concatenate([noise1, noise2])
         np.random.shuffle(noise)
-        noise = list(noise)
-        r_seg_len, l_seg_len = (inp_seg_len%2)+(inp_seg_len//2), inp_seg_len//2
-        init_q = random.choices(range(1, 40), mis_q_distr, k=2)
-        r_seg, l_seg = [init_q[0]], [init_q[1]]
-        for i in range(l_seg_len):
-            l_seg.append(round(match_autoreg_specs[0]*l_seg[-1] + noise.pop() + match_autoreg_specs[8]))
-        for i in range(r_seg_len):
-            r_seg.append(round(match_autoreg_specs[0]*r_seg[-1] + noise.pop() + match_autoreg_specs[8]))
-        out_q = r_seg[1:] + l_seg[:-1][::-1]
-    if seg_type == 'mis':
-        out_q = random.choices(range(1, 40), mis_q_distr, k=inp_seg_len)
-    if seg_type == 'ins':
-        out_q = random.choices(range(1, 40), ins_q_distr, k=inp_seg_len)
-    if seg_type == 'start_unalig':
-        out_q = random.choices(range(1, 35), start_q_distr, k=inp_seg_len)
-    if seg_type == 'end_unalig':
-        out_q = random.choices(range(1, 30), end_q_distr, k=inp_seg_len)
-    return ''.join(map(lambda x: chr(x+33), out_q))
+        noise = noise[:n_noise]
 
-def read_hp(hp_length, sym_hp):
-    if hp_length > 28: hp_length = 28
-    dist_vals = hp_distr_dict[str(hp_length)+sym_hp]
-    hp_len1 = round(random.gauss(dist_vals[0], dist_vals[1]))
-    if hp_len1 < 1: hp_len1 = 1
-    return hp_len1
+        center = inp_seg_len // 2
+        out_q[center] = np.random.randint(7, 12)
 
+        for i in range(center - 1, -1, -1):
+            val = alpha * out_q[i + 1] + noise[i] + offset
+            out_q[i] = int(np.clip(round(val), 3, 38))
 
-def gen_hp_qual(hp_len, sym_hp):
-    hp_qual_str = r''
-    for hp_pos in range(1, hp_len+1):
-        if hp_pos > 7: hp_pos = 7
-        qual_specs = hp_qual_dict[str(hp_pos)+sym_hp]
-        base_qual = round(skewnorm.rvs(a=qual_specs[2], loc=qual_specs[0], scale=qual_specs[1], size=1)[0])
-        if base_qual < 1: base_qual = 1
-        hp_qual_str += chr(base_qual+33)
-    return hp_qual_str
+        for i in range(center + 1, inp_seg_len):
+            idx = i - center - 1 + center
+            val = alpha * out_q[i - 1] + noise[idx] + offset
+            out_q[i] = int(np.clip(round(val), 3, 38))
 
+    elif seg_type == 'mis':
+        bins = np.arange(1, 40)
+        probs = mis_q_distr / mis_q_distr.sum() if mis_q_distr.sum() > 0 else np.full(39, 1/39)
+        out_q = np.random.choice(bins, size=inp_seg_len, p=probs)
+
+    elif seg_type == 'ins':
+        bins = np.arange(1, 40)
+        probs = ins_q_distr / ins_q_distr.sum() if ins_q_distr.sum() > 0 else np.full(39, 1/39)
+        out_q = np.random.choice(bins, size=inp_seg_len, p=probs)
+
+    elif seg_type == 'start_unalig':
+        bins = np.arange(1, 35)
+        probs = start_q_distr / start_q_distr.sum() if start_q_distr.sum() > 0 else np.full(34, 1/34)
+        out_q = np.random.choice(bins, size=inp_seg_len, p=probs)
+
+    elif seg_type == 'end_unalig':
+        bins = np.arange(1, 30)
+        probs = end_q_distr / end_q_distr.sum() if end_q_distr.sum() > 0 else np.full(29, 1/29)
+        out_q = np.random.choice(bins, size=inp_seg_len, p=probs)
+
+    return ''.join(chr(min(40, max(3, int(q))) + 33) for q in out_q)
 
 
+def simulate_homopolymer(ref_len, base, hp_distr_dict):
+    """Simulate observed homopolymer length based on reference length."""
+    base = base.upper()
+    if ref_len > 28:
+        ref_len = 28
 
-
-
-
-lens = np.arange(1, 199)
-def make_errors2(tr_seq, hps, add_long_unalig):
-    # posible states are match, mis, del and ins
-    tr_seq = str(tr_seq)
-    read = ''
-    q_str = r''
-    pos = 0
-    state = 'match'
-    st_num = 0
-    tr_len = len(tr_seq)
-    tr_hps = hps + tr_len
-    hp_df = pd.DataFrame(tr_hps)
-    tr_hps = hp_df[hp_df[0]>0].to_numpy()
-    n_deleted = 0
-    for n_homopol in range(1, len(tr_hps)):
-    	n_homopol -= n_deleted
-    	if (tr_hps[n_homopol][0]-tr_hps[n_homopol-1][1])==0:
-        	tr_hps = np.delete(tr_hps, n_homopol, axis=0)
-        	n_deleted += 1
-    if tr_len < 500:
-        states_number = 120
+    key = f"{ref_len}{base}"
+    if key not in hp_distr_dict:
+        mu = 0.8 * np.log1p(ref_len)
+        sigma = 0.9 * np.sqrt(ref_len)
     else:
-        states_number = round(tr_len / 4)
-    match_lens = np.array(random.choices(lens, weights=hist_match, k=states_number * 2)).astype(int)
-    mis_lens = pois_geom(mis_params[0], mis_params[1], mis_params[2], states_number).astype(int)
-    del_lens = weibull_geom(del_params[0], del_params[1], del_params[2], states_number).astype(int)
-    ins_lens = weibull_geom(ins_params[0], ins_params[1], ins_params[2], states_number).astype(int)
-    while tr_len > pos:
-        # print('start')
-        seg_len = 0
-        mis_after_indel = False
-        if state == 'match':
-            if tr_hps.size == 0 or tr_hps[:, 0][(tr_hps[:, 0] - pos < 199) & (tr_hps[:, 0] - pos > 0)].size == 0:
-                seg_len = match_lens[st_num]
-                if pos + seg_len > tr_len:
-                    seg_len = tr_len - pos
-                match_len = int(seg_len)
-                read += tr_seq[pos:pos + seg_len]
-                q_str += gen_qual(state, seg_len)
-            else:
-                hp_start = tr_hps[:, 0][(tr_hps[:, 0] - pos < 199) & (tr_hps[:, 0] - pos > 0)].min()
-                seg_len = match_lens[st_num]
-                if hp_start - pos > 15:
-                    while not hp_start - (pos + seg_len) > 10:
-                        seg_len = random.choice(match_lens)
-                    match_len = int(seg_len)
-                    read += tr_seq[pos:pos + seg_len]
-                    q_str += gen_qual(state, seg_len)
-                else:
-                    try:
-                        hp_end = tr_hps[np.where(tr_hps == hp_start)[0], np.where(tr_hps == hp_start)[1] + 1][0]
-                        after_hp = 0
-                        seg_len = hp_end + after_hp - pos
-                        match_len = int(seg_len)
-                        read += tr_seq[pos:hp_start]
-                        q_str += gen_qual(state, hp_start - pos + 4)[:-4]
-                        # print(hp_end)
-                        hp_in_read_len = read_hp(hp_end - hp_start, tr_seq[hp_start])
-                        # print(tr_seq[hp_start:hp_end])
-                        read += tr_seq[hp_start] * hp_in_read_len
-                        read += tr_seq[hp_end:hp_end + after_hp]
-                        q_str += gen_hp_qual(hp_in_read_len, tr_seq[hp_start])  # qual for hp_seg
-                        state = 'hp'
-                        # q_str += gen_qual(state, after_hp+5)[:-5]
-                    except:
-                        print('error while simulating hp, read is skipped')
-                        print(tr_hps)
-                        print('trouble hp start in pos' + str(hp_start))
-                        print(tr_seq[hp_start - 1:hp_start + 10])
-                        state = 'hp'
-        elif state == 'mis':
-            mismatch = ''
-            seg_len = mis_lens[st_num]
-            # adj_reg = read[pos-match_len:]
-            changed = False
-            shift = 0
-            while not changed:
-                if shift == 0:
-                    if random.random() < mis_probs[base_to_dig(tr_seq[pos])]:
-                        changed = True
-                        continue
-                    else:
-                        shift += 1
-                        continue
-                if pos + shift + seg_len <= tr_len and random.random() < mis_probs[base_to_dig(tr_seq[pos + shift])]:
-                    changed = True
-                elif match_len - shift > 0 and random.random() < mis_probs[base_to_dig(read[-shift])]:
-                    changed = True
-                    shift = -shift
-                else:
-                    shift += 1
-                if pos + shift + seg_len >= tr_len and match_len - shift < 0 and not changed:
-                    shift = 0
-            # if shift == -1: shift = -2
-            if shift >= 0:
-                read += tr_seq[pos:pos + shift]
-            else:
-                read = str(read[:shift])
-            q_str = q_str[:-match_len]
-            pos += shift
-            q_str += gen_qual('match', match_len + shift)
-            if pos + seg_len > tr_len:
-                seg_len = tr_len - pos
-            for i in range(seg_len):
-                alp = ['A', 'T', 'G', 'C']
-                dig_base = base_to_dig(tr_seq[pos + i])
-                subs_probs = list(stab[dig_base])
-                alp.remove(tr_seq[pos + i])
-                subs_probs.pop(dig_base)
-                mismatch += random.choices(alp, subs_probs)[0]
-            read += mismatch
-            q_str += gen_qual(state, seg_len)
-        elif state == 'del':
-            seg_len = del_lens[st_num]
-            if random.random() < mis_after_del_prob:
-                mis_after_indel = True
-        elif state == 'ins':
-            seg_len = ins_lens[st_num]
-            insertion = ''
-            for i in range(seg_len):
-                insertion += random.choice(['A', 'T', 'G', 'C'])
-            read += insertion
-            q_str += gen_qual(state, seg_len)
-            seg_len = 0
-            if random.random() < mis_after_del_prob:
-                mis_after_indel = True
+        mu, sigma = hp_distr_dict[key]
 
-        elif state == 'mis_after_indel':
-            mismatch = ''
-            seg_len = 1
-            if pos + seg_len > tr_len:
-                seg_len = tr_len - pos
-            for i in range(seg_len):
-                alp = ['A', 'T', 'G', 'C']
-                dig_base = base_to_dig(tr_seq[pos + i])
-                subs_probs = list(stab[dig_base])
-                alp.remove(tr_seq[pos + i])
-                subs_probs.pop(dig_base)
-                mismatch += random.choices(alp, subs_probs)[0]
-            read += mismatch
-            q_str += gen_qual('mis', seg_len)
+    shift = int(round(np.random.normal(mu, sigma)))
+    obs_len = max(1, ref_len + shift)
+    return obs_len
 
-        if state == 'match':
-            state = random.choices(['mis', 'ins', 'del'], weights=err_prob)[0]
-        elif mis_after_indel:
-            state = 'mis_after_indel'
+
+def gen_hp_qual(hp_len, base, hp_qual_dict):
+    """Generate position-specific quality for homopolymer."""
+    base = base.upper()
+    qual_str = ''
+
+    for pos in range(hp_len):
+        pos_key = f"{min(pos + 1, 7)}{base}"
+        if pos_key in hp_qual_dict:
+            loc, scale, shape = hp_qual_dict[pos_key]
+            q_val = int(round(skewnorm.rvs(a=shape, loc=loc, scale=scale)))
         else:
-            state = 'match'
-        pos += seg_len
-        st_num += 1
+            q_val = np.random.randint(5, 12)
 
-    polyA_len = geom.rvs(0.18, 4)
-    read += ''.join(random.choices(['A', 'T', 'G', 'C'], weights=[0.91, 0.03, 0.03, 0.03], k=polyA_len))  # add polyA
-    q_str += gen_qual('end_unalig', polyA_len)
+        q_val = min(40, max(3, q_val))
+        qual_str += chr(q_val + 33)
 
-    start_ualig_len = geom.rvs(0.3, -1)
-    read = ''.join(random.choices(['A', 'T', 'G', 'C'], k=start_ualig_len)) + read
-    q_str = gen_qual('start_unalig', start_ualig_len) + q_str
+    return qual_str
 
+
+def fragmentation_distribution(transcript_len, n_reads, frag_prob):
+    """Generate fragment lengths according to geometric fragmentation model."""
+    positions = np.arange(1, transcript_len + 1)
+    survival = (1 - frag_prob) ** (positions - 1)
+    density = survival * frag_prob
+    density[-1] += (1 - frag_prob) ** transcript_len
+    density = density / density.sum()
+    sampled_lengths = np.random.choice(positions, size=n_reads, p=density)
+    return sampled_lengths
+
+
+def make_errors_with_sync(seq, homopolymers, model_dict):
+    """Introduce errors with guaranteed sequence/quality length synchronization."""
+    if len(seq) == 0:
+        return '', ''
+
+    hist_match = np.array(model_dict['hist_match'])
+    mis_params = model_dict['mis_params']
+    ins_params = model_dict['ins_params']
+    del_params = model_dict['del_params']
+    err_prob = model_dict['err_prob']
+    mis_after_ins = model_dict['mis_after_ins']
+    mis_after_del = model_dict['mis_after_del']
+    base_stability = np.array(model_dict['base_stability']).reshape(4, 4)
+    hp_distr_dict = model_dict['hp_distr_dict']
+    hp_qual_dict = model_dict['hp_qual_dict']
+
+    # Pre-generate distributions
+    match_lens = np.random.choice(np.arange(1, 199), size=500, p=hist_match / hist_match.sum())
+    mis_lens = np.random.poisson(mis_params[0], size=200) + 1
+    ins_lens = np.ceil(np.random.weibull(ins_params[0], size=200)).astype(int)
+    del_lens = np.ceil(np.random.weibull(del_params[0], size=200)).astype(int)
+
+    read_bases = []
+    read_quals = []
+    pos = 0
+    seq_len = len(seq)
+    hp_idx = 0
+
+    while pos < seq_len:
+        in_hp = False
+        current_hp = None
+
+        if hp_idx < len(homopolymers):
+            hp_start, hp_end, hp_base = homopolymers[hp_idx]
+            if hp_start <= pos < hp_end:
+                in_hp = True
+                current_hp = (hp_start, hp_end, hp_base)
+            elif pos >= hp_end:
+                hp_idx += 1
+
+        if in_hp:
+            hp_start, hp_end, hp_base = current_hp
+            ref_hp_len = hp_end - hp_start
+            obs_hp_len = simulate_homopolymer(ref_hp_len, hp_base, hp_distr_dict)
+            hp_seq = hp_base * obs_hp_len
+            read_bases.append(hp_seq)
+            read_quals.append(gen_hp_qual(obs_hp_len, hp_base, hp_qual_dict))
+            pos = hp_end
+            continue
+
+        match_len = int(match_lens[np.random.randint(len(match_lens))])
+        match_len = min(match_len, seq_len - pos)
+        if match_len <= 0:
+            pos += 1
+            continue
+
+        seg_seq = seq[pos:pos + match_len]
+        seg_qual = gen_qual('match', match_len, model_dict)
+        read_bases.append(seg_seq)
+        read_quals.append(seg_qual)
+        pos += match_len
+
+        if pos < seq_len and np.random.random() < sum(err_prob):
+            error_type = np.random.choice(['mis', 'ins', 'del'], p=np.array(err_prob) / sum(err_prob))
+
+            if error_type == 'mis' and pos < seq_len:
+                ref_base = seq[pos].upper()
+                ref_idx = base_to_dig(ref_base)
+                if ref_idx != -1:
+                    subs_probs = base_stability[ref_idx].copy()
+                    subs_probs[ref_idx] = 0
+                    if subs_probs.sum() > 0:
+                        subs_probs = subs_probs / subs_probs.sum()
+                        obs_base = np.random.choice(['A', 'T', 'G', 'C'], p=subs_probs)
+                    else:
+                        obs_base = ref_base
+                else:
+                    obs_base = np.random.choice(['A', 'T', 'G', 'C'])
+                read_bases.append(obs_base)
+                read_quals.append(gen_qual('mis', 1, model_dict))
+                pos += 1
+
+            elif error_type == 'ins':
+                ins_len = int(ins_lens[np.random.randint(len(ins_lens))])
+                ins_seq = ''.join(np.random.choice(['A', 'T', 'G', 'C'], size=ins_len))
+                read_bases.append(ins_seq)
+                read_quals.append(gen_qual('ins', ins_len, model_dict))
+
+            elif error_type == 'del':
+                del_len = int(del_lens[np.random.randint(len(del_lens))])
+                pos += del_len
+
+    final_seq = ''.join(read_bases)
+    final_qual = ''.join(read_quals)
+    min_len = min(len(final_seq), len(final_qual))
+    return final_seq[:min_len], final_qual[:min_len]
+
+
+def add_biological_artifacts(read_seq, qual_str, model_dict, add_long_unalig=False):
+    """Add poly-A tail and unaligned terminal regions."""
+    # 5' unaligned region
+    start_unalig_len = geom.rvs(0.3) - 1
+    if start_unalig_len > 0:
+        start_seq = ''.join(np.random.choice(['A', 'T', 'G', 'C'], size=start_unalig_len))
+        start_qual = gen_qual('start_unalig', start_unalig_len, model_dict)
+        read_seq = start_seq + read_seq
+        qual_str = start_qual + qual_str
+
+    # Poly-A tail
+    polyA_len = geom.rvs(0.18) + 3
+    polyA_seq = 'A' * polyA_len
+    polyA_qual = gen_qual('end_unalig', polyA_len, model_dict)
+    read_seq += polyA_seq
+    qual_str += polyA_qual
+
+    # Long 3' unaligned region
     if add_long_unalig:
-        long_seg_len = random.randint(70, 120)
-        read += ''.join(random.choices(['A', 'T', 'G', 'C'], weights=[31.6, 26.4, 1.7, 40.4],
-                                       k=long_seg_len))  # add long unalig region
-        q_str += gen_qual('end_unalig', long_seg_len)
+        long_unalig_len = np.random.randint(70, 120)
+        long_seq = ''.join(np.random.choice(
+            ['A', 'T', 'G', 'C'],
+            size=long_unalig_len,
+            p=[0.316, 0.264, 0.017, 0.403]
+        ))
+        long_qual = gen_qual('end_unalig', long_unalig_len, model_dict)
+        read_seq += long_seq
+        qual_str += long_qual
 
-        if len(read) != len(q_str):
-            print(len(read) - len(q_str), len(read), len(q_str), match_len, pos)
-            return read, q_str, len(read) - len(q_str)
-    # print('{}'.format(state))
-    return read, q_str
+    min_len = min(len(read_seq), len(qual_str))
+    return read_seq[:min_len], qual_str[:min_len]
 
 
-procs = []
-prof_step = exp_prof.shape[0]//threads
-for thread_num in range(threads):
-    if thread_num + 1 == threads:
-        part_prof = exp_prof[thread_num*prof_step:].copy()
-    else:
-        part_prof = exp_prof[thread_num*prof_step:(thread_num+1)*prof_step].copy()
+def simulate_transcript_chunk(args):
+    """Simulate reads for a chunk of transcripts (multiprocessing worker)."""
+    transcript_ids, counts_list, transcriptome_path, model_dict, seed_offset = args
 
-    if args.seed is None:
-        input_seed = None
-    else:
-        input_seed = args.seed + thread_num
-    procs.append(Process(target=simulate_fastq,
-                         args=(transcripts, part_prof, frag_prob, out_file + '.' + str(thread_num), input_seed,)))
-for i in range(threads):
-    procs[i].start()
-for i in range(threads):
-    procs[i].join()
+    # Set thread-specific seed
+    if seed_offset is not None:
+        random.seed(seed_offset)
+        np.random.seed(seed_offset)
 
-if threads == 1:
-    os.system('mv {}.0 {}'.format(out_file, out_file))
-else:
-    for i in range(1, threads):
-        os.system('cat {}.{} >> {}.0'.format(out_file, i, out_file))
-        os.system('rm {}.{}'.format(out_file, i))
-    os.system('mv {}.0 {}'.format(out_file, out_file))
+    # Open transcriptome (each process has its own handle)
+    transcripts = pysam.FastaFile(transcriptome_path)
+    results = []
+    total_reads = 0
 
-print('Simulation successfully completed')
-#simulate_fastq(transcriptome=transcripts, expression_prof=exp_prof, fragmentation_rate=frag_prob, filename=out_file)
+    for tx_id, n_reads in zip(transcript_ids, counts_list):
+        try:
+            tx_seq = transcripts.fetch(tx_id).upper().replace('U', 'T')
+        except KeyError:
+            continue
+
+        if len(tx_seq) < 50:
+            continue
+
+        homopolymers = identify_homopolymers(tx_seq, min_length=5)
+        frag_lengths = fragmentation_distribution(len(tx_seq), n_reads, model_dict['frag_prob'])
+        n_with_long_unalig = int(n_reads * 0.25)
+
+        for i, target_len in enumerate(frag_lengths):
+            max_start = max(0, len(tx_seq) - target_len)
+            start_pos = np.random.randint(0, max_start + 1) if max_start > 0 else 0
+            fragment_seq = tx_seq[start_pos:start_pos + target_len]
+            add_long_unalig = (i < n_with_long_unalig)
+
+            read_seq, qual_str = make_errors_with_sync(fragment_seq, homopolymers, model_dict)
+            read_seq, qual_str = add_biological_artifacts(read_seq, qual_str, model_dict, add_long_unalig)
+
+            # Final length synchronization
+            min_len = min(len(read_seq), len(qual_str))
+            if min_len > 0:
+                results.append(f"@{tx_id}_read_{total_reads}\n{read_seq[:min_len]}\n+\n{qual_str[:min_len]}\n")
+                total_reads += 1
+
+    transcripts.close()
+    return results
+
+
+def main():
+    global _triangular_warnings_issued
+    _triangular_warnings_issued = set()
+
+    # ============================================================================
+    # STAGE 1: Argument parsing (ORIGINAL INTERFACE PRESERVED)
+    # ============================================================================
+    parser = argparse.ArgumentParser(
+        description='TNRSim Simulator — Nanopore direct RNA sequencing simulator',
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument('-m', '--model', type=str, required=True,
+                        help='Path to TNRSim model file (TSV format)')
+    parser.add_argument('-t', '--transcriptome', type=str, required=True,
+                        help='FASTA file with transcript sequences')
+    parser.add_argument('-e', '--exp_prof', type=str, required=True,
+                        help='TSV file with expression profile (columns: transcript_id, counts)')
+    parser.add_argument('-O', '--output', type=str, default='simulated_reads.fastq',
+                        help='Output FASTQ file (default: simulated_reads.fastq)')
+    parser.add_argument('--threads', type=int, default=1,
+                        help='Number of CPU cores for simulation (default: 1)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed for reproducibility (default: None)')
+    parser.add_argument('-f', '--fragmentation_probability', type=float, default=None,
+                        help='Override fragmentation probability from model')
+
+    args = parser.parse_args()
+
+    print("="*80)
+    print("TNRSim Simulator — Stage 1: Initialization")
+    print("="*80)
+    print(f"[INFO] Model file:          {args.model}")
+    print(f"[INFO] Transcriptome:       {args.transcriptome}")
+    print(f"[INFO] Expression profile:  {args.exp_prof}")
+    print(f"[INFO] Output file:         {args.output}")
+    print(f"[INFO] Threads:             {args.threads}")
+    print(f"[INFO] Random seed:         {args.seed if args.seed is not None else 'None (non-deterministic)'}")
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        print(f"[INFO] Random seed set to {args.seed} for reproducibility")
+
+    # ============================================================================
+    # STAGE 2: Model loading and parsing
+    # ============================================================================
+    print("\n" + "="*80)
+    print("TNRSim Simulator — Stage 2: Model Loading & Parsing")
+    print("="*80)
+
+    for fname, label in [(args.model, 'model'), (args.transcriptome, 'transcriptome'), (args.exp_prof, 'expression profile')]:
+        if not os.path.exists(fname):
+            print(f"[ERROR] {label.capitalize()} file not found: {fname}", file=sys.stderr)
+            sys.exit(1)
+
+    try:
+        seq_model = pd.read_csv(args.model, sep='\t')
+        print(f"[INFO] Loaded model with {len(seq_model)} parameters")
+    except Exception as e:
+        print(f"[ERROR] Failed to load model file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    model_dict = {}
+    for _, row in seq_model.iterrows():
+        param_name = row['params']
+        param_value = parse_model_value(row['values'])
+        model_dict[param_name] = param_value
+
+    print("[INFO] Extracting homopolymer parameters...")
+    model_dict['hp_distr_dict'] = load_homopolymer_params(seq_model, '_hp_spec')
+    model_dict['hp_qual_dict'] = load_homopolymer_params(seq_model, '_hp_spec_qual')
+
+    if args.fragmentation_probability is not None:
+        print(f"[INFO] Overriding fragmentation probability: {model_dict['frag_prob']} → {args.fragmentation_probability}")
+        model_dict['frag_prob'] = args.fragmentation_probability
+
+    # ============================================================================
+    # STAGE 3: Data validation
+    # ============================================================================
+    print("\n" + "="*80)
+    print("TNRSim Simulator — Stage 3: Data Validation")
+    print("="*80)
+
+    try:
+        exp_prof = pd.read_csv(args.exp_prof, sep='\t')
+        if 'transcript_id' not in exp_prof.columns or 'counts' not in exp_prof.columns:
+            if 'Geneid' in exp_prof.columns:
+                exp_prof.rename(columns={'Geneid': 'transcript_id'}, inplace=True)
+            if exp_prof.shape[1] >= 2:
+                exp_prof.rename(columns={exp_prof.columns[0]: 'transcript_id', exp_prof.columns[1]: 'counts'}, inplace=True)
+        if 'transcript_id' not in exp_prof.columns or 'counts' not in exp_prof.columns:
+            raise ValueError(f"Expression profile must contain 'transcript_id' and 'counts' columns")
+        exp_prof = exp_prof[exp_prof['counts'] > 0].copy()
+        exp_prof['counts'] = exp_prof['counts'].astype(int)
+        print(f"[INFO] Loaded expression profile: {len(exp_prof)} transcripts with >0 reads")
+    except Exception as e:
+        print(f"[ERROR] Failed to load expression profile: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        transcripts = pysam.FastaFile(args.transcriptome)
+        tx_count = len(transcripts.references)
+        print(f"[INFO] Loaded transcriptome: {tx_count} transcripts")
+        tx_in_fasta = set(transcripts.references)
+        tx_in_exp = set(exp_prof['transcript_id'])
+        tx_overlap = tx_in_fasta & tx_in_exp
+        if len(tx_overlap) == 0:
+            print("[ERROR] No overlap between expression profile and transcriptome!", file=sys.stderr)
+            sys.exit(1)
+        exp_prof = exp_prof[exp_prof['transcript_id'].isin(tx_overlap)].copy()
+        print(f"[INFO] Filtered to {len(exp_prof)} transcripts present in both datasets")
+        transcripts.close()
+    except Exception as e:
+        print(f"[ERROR] Failed to load transcriptome: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    validate_model(model_dict)
+
+    # ============================================================================
+    # STAGES 4-8: Error simulation with multiprocessing
+    # ============================================================================
+    print("\n" + "="*80)
+    print("TNRSim Simulator — Stages 4-8: Error Simulation & Parallel Execution")
+    print("="*80)
+
+    n_threads = min(args.threads, cpu_count(), len(exp_prof))
+    print(f"[INFO] Using {n_threads} threads for simulation")
+
+    # Split transcripts into chunks
+    transcript_ids = exp_prof['transcript_id'].tolist()
+    counts_list = exp_prof['counts'].tolist()
+    chunk_size = max(1, len(transcript_ids) // n_threads)
+    chunks = []
+    for i in range(n_threads):
+        start_idx = i * chunk_size
+        end_idx = start_idx + chunk_size if i < n_threads - 1 else len(transcript_ids)
+        chunk_tx = transcript_ids[start_idx:end_idx]
+        chunk_counts = counts_list[start_idx:end_idx]
+        seed_offset = args.seed + i if args.seed is not None else None
+        chunks.append((chunk_tx, chunk_counts, args.transcriptome, model_dict.copy(), seed_offset))
+
+    # Run simulation in parallel
+    start_time = time.time()
+    total_reads = 0
+
+    with Pool(processes=n_threads) as pool:
+        results = pool.map(simulate_transcript_chunk, chunks)
+
+    # Write results to output file
+    with open(args.output, 'w') as out_f:
+        for chunk_results in results:
+            for record in chunk_results:
+                out_f.write(record)
+                total_reads += 1
+
+    elapsed = time.time() - start_time
+
+    # ============================================================================
+    # FINAL SUMMARY
+    # ============================================================================
+    print("\n" + "="*80)
+    print("SIMULATION COMPLETED SUCCESSFULLY")
+    print("="*80)
+    print(f"[SUMMARY]")
+    print(f"  Total transcripts simulated: {len(exp_prof)}")
+    print(f"  Total reads generated:       {total_reads:,}")
+    print(f"  Mean read length:            ~{int(1.0/model_dict['frag_prob'])} nt (theoretical)")
+    print(f"  Execution time:              {elapsed:.1f} seconds")
+    print(f"  Throughput:                  {total_reads/elapsed:.0f} reads/sec")
+    print(f"\n[OUTPUT] FASTQ file saved to: {args.output}")
+    print("="*80)
+
+
+if __name__ == '__main__':
+    main()
