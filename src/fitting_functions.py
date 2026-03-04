@@ -1,202 +1,158 @@
+#!/usr/bin/env python3
+
 import numpy as np
-import pandas as pd
-import pysam
-from scipy.signal import find_peaks
-from scipy.signal import peak_widths
-from scipy.stats import geom
-from pydtmc import MarkovChain
-import random
-from scipy.optimize import minimize
-from math import ceil
-from re import search
-from multiprocessing import Pool
-from time import perf_counter
-import sys
-from statistics import mean
 from scipy.stats import skewnorm
 
 
 def seq_to_dig(read_seq):
-    def base_to_dig(letter):
-        if letter == 'A': return 0
-        if letter == 'T': return 1
-        if letter == 'G': return 2
-        if letter == 'C': return 3
-
-    return list(map(base_to_dig, list(read_seq)))
-
-def weibull_geom(a, pr, weight):
-    rand_arr = np.append(np.ceil(np.random.weibull(a, round(10000*weight))),
-                                 np.random.geometric(pr, round(10000*((1-weight)))))
-    np.random.shuffle(rand_arr)
-    return rand_arr
-
-def pois_geom(lam, pr, weight):
-    rand_arr = np.append(1 + np.random.poisson(lam, round(10000*weight)),
-                                 np.random.geometric(pr, round(10000*((1-weight)))))
-    np.random.shuffle(rand_arr)
-    return rand_arr
+    base_map = {'A': 0, 'T': 1, 'U': 1, 'G': 2, 'C': 3}
+    return [base_map.get(base.upper(), -1) for base in read_seq]
 
 
-def mix_weibul_distr_fit(pl, real_distr):
-    loss = 0
-    if pl[0] <= 0: pl[0] = 0.001
-    #pl[0] = 0.99 if pl[0] >= 1
-    if pl[1] <= 0: pl[1] = 0.001
-    if pl[1] >= 1: pl[1] = 0.99
-    if pl[2] < 0: pl[2] = 0
-    if pl[2] > 1: pl[2] = 1
-    for i in range(30):
-        loss += np.sum(np.abs(np.histogram(real_distr,
-                                    density=True)[0] - np.histogram(weibull_geom(pl[0], pl[1], pl[2]), density=True)[0]))
-    return loss/30
+def weibull_geom(a, pr, weight, size=10000):
+    n_weibull = int(size * weight)
+    n_geom = size - n_weibull
+
+    weibull_samples = np.ceil(np.random.weibull(a, n_weibull)).astype(int)
+    geom_samples = np.random.geometric(pr, n_geom)
+
+    combined = np.concatenate([weibull_samples, geom_samples])
+    np.random.shuffle(combined)
+    return combined
 
 
-def mix_pois_distr_fit(pl, real_distr):
-    loss = 0
-    if pl[0] <= 0: pl[0] = 0.001
-    #pl[0] = 0.99 if pl[0] >= 1
-    if pl[1] <= 0: pl[1] = 0.001
-    if pl[1] >= 1: pl[1] = 0.99
-    if pl[2] < 0: pl[2] = 0
-    if pl[2] > 1: pl[2] = 1
-    for i in range(30):
-        loss += np.sum(np.abs(np.histogram(real_distr,
-                                    density=True, bins=5)[0] - np.histogram(pois_geom(pl[0], pl[1], pl[2]), density=True, bins=5)[0]))
-    return loss/30
+def pois_geom(lam, pr, weight, size=10000):
+    n_pois = int(size * weight)
+    n_geom = size - n_pois
 
-def digs_to_err(diget):
-    if diget == '0':
-        return 'match'
-    if diget == '1':
-        return 'mis'
-    if diget == '2':
-        return 'ins'
-    if diget == '3':
-        return 'del'
+    pois_samples = 1 + np.random.poisson(lam, n_pois)
+    geom_samples = np.random.geometric(pr, n_geom)
+
+    combined = np.concatenate([pois_samples, geom_samples])
+    np.random.shuffle(combined)
+    return combined
+
+
+def mix_weibul_distr_fit(params, real_distr):
+    if len(real_distr) == 0 or np.all(real_distr <= 0):
+        return 1e6
+
+    a, pr, weight = params
+
+    max_val = max(30, int(np.percentile(real_distr[real_distr > 0], 99)) + 5)
+    bins = np.arange(0, max_val + 1)
+
+    real_hist, _ = np.histogram(real_distr, bins=bins, density=True)
+
+    sim_distr = weibull_geom(a, pr, weight, size=max(10000, len(real_distr) * 10))
+    sim_hist, _ = np.histogram(sim_distr, bins=bins, density=True)
+
+    min_len = min(len(real_hist), len(sim_hist))
+    return np.mean(np.abs(real_hist[:min_len] - sim_hist[:min_len]))
+
+
+def mix_pois_distr_fit(params, real_distr):
+    if len(real_distr) == 0 or np.all(real_distr <= 0):
+        return 1e6
+
+    lam, pr, weight = params
+
+    max_val = max(20, int(np.percentile(real_distr[real_distr > 0], 99)) + 5)
+    bins = np.arange(0, max_val + 1)
+
+    real_hist, _ = np.histogram(real_distr, bins=bins, density=True)
+    sim_distr = pois_geom(lam, pr, weight, size=max(10000, len(real_distr) * 10))
+    sim_hist, _ = np.histogram(sim_distr, bins=bins, density=True)
+
+    min_len = min(len(real_hist), len(sim_hist))
+    return np.mean(np.abs(real_hist[:min_len] - sim_hist[:min_len]))
+
+
+def digs_to_err(digit):
+    mapping = {'0': 'match', '1': 'mis', '2': 'ins', '3': 'del',
+               0: 'match', 1: 'mis', 2: 'ins', 3: 'del'}
+    return mapping.get(digit, 'unknown')
+
 
 def err_type(df_row):
-    err = 10
-    if df_row['base'] in ['a', 't', 'g', 'c']: #mismatch
-        err = 1
-    elif df_row['read'] > 1: #insertion
-        err = 2
-    elif df_row['ref'] > 1: #deletion
-        err = 3
-    else: #match
-        err = 0
-    assert(err != 10)
-    #return [df_row['read'], df_row['ref'], df_row['base'], err] #index=['read', 'ref', 'base', 'error'])
-    return err
+    base = str(df_row['base']).lower()
+    if base in ['a', 't', 'g', 'c', 'u']:
+        return 1
+    elif df_row['read'] > 1:
+        return 2
+    elif df_row['ref'] > 1:
+        return 3
+    else:
+        return 0
 
 
 def err_seq(df_row):
-    err = 10
-    if df_row['ref'] == 1 and df_row['read'] == 1 and df_row['base'] in ['A', 'T', 'G', 'C']:
+    base_upper = str(df_row['base']).upper()
+    base_lower = str(df_row['base']).lower()
+
+    if df_row['ref'] == 1 and df_row['read'] == 1 and base_upper in ['A', 'T', 'G', 'C', 'U']:
         return '0'
-    if df_row['ref'] == 1 and df_row['read'] == 1 and df_row['base'] in ['a', 't', 'g', 'c']:
+
+    if df_row['ref'] == 1 and df_row['read'] == 1 and base_lower in ['a', 't', 'g', 'c', 'u']:
         return '1'
-    if df_row['ref'] > 1 and df_row['base'] in ['A', 'T', 'G', 'C']:  # insertion
-        return '2'*int((df_row['ref']-1))
-    if df_row['read'] > 1 and df_row['base'] in ['A', 'T', 'G', 'C']:  # deletion
-        return '3'*int((df_row['read']-1))
-    if df_row['ref'] > 1 and df_row['base'] in ['a', 't', 'g', 'c']:  # insertion and mismatch after
-        return '2'*int((df_row['ref']-1)) + '1'
-    if df_row['read'] > 1 and df_row['base'] in ['a', 't', 'g', 'c']:  # deletion and mismatch after
-        return '3'*int((df_row['read']-1)) + '1'
+
+    if df_row['read'] > 1:
+        ins_len = int(df_row['read'] - 1)
+        suffix = '1' if base_lower in ['a', 't', 'g', 'c', 'u'] else ''
+        return '2' * ins_len + suffix
+
+    if df_row['ref'] > 1:
+        del_len = int(df_row['ref'] - 1)
+        suffix = '1' if base_lower in ['a', 't', 'g', 'c', 'u'] else ''
+        return '3' * del_len + suffix
+
+    return '0'
 
 
+def mix_hp_distr_fit(params, ref_len, observed_shifts):
+    if len(observed_shifts) == 0:
+        return 1e6
+
+    mu_scale, sigma_base = params
+
+    sigma = sigma_base * np.sqrt(max(1.0, float(ref_len)))
+    mu = mu_scale * np.log1p(float(ref_len))
+
+    max_shift = max(20, int(0.4 * ref_len) + 10)
+    bins = np.arange(-max_shift, max_shift + 1)
+
+    real_hist, _ = np.histogram(observed_shifts, bins=bins, density=True)
+
+    sim_shifts = np.round(np.random.normal(mu, sigma, size=max(5000, len(observed_shifts) * 5))).astype(int)
+    sim_shifts = sim_shifts[(sim_shifts >= -max_shift) & (sim_shifts <= max_shift)]
+
+    if len(sim_shifts) == 0:
+        return 1e6
+
+    sim_hist, _ = np.histogram(sim_shifts, bins=bins, density=True)
+
+    min_len = min(len(real_hist), len(sim_hist))
+    return np.mean(np.abs(real_hist[:min_len] - sim_hist[:min_len]))
 
 
+def hp_qual_distr_fit_skewed_normal(params, real_q_arr):
+    if len(real_q_arr) == 0:
+        return 1e6
 
-def mix_hp_distr_fit(pl, real_hp_distr):
-    loss = 0
-    if pl[1] <= 0: pl[1] = 0.001
-    for i in range(30):
-        loss += np.sum(np.abs(np.histogram(real_hp_distr,
-            density=True, bins=60)[0] - np.histogram(np.random.normal(pl[0], pl[1], 300), density=True, bins=60)[0]))
-    return loss/30
+    valid_q = real_q_arr[(real_q_arr >= 0) & (real_q_arr <= 40)]
+    if len(valid_q) == 0:
+        return 1e6
 
+    loc, scale, shape = params
 
+    bins = np.arange(0, 41)
 
-def hp_qual_distr_fit_skewed_normal(pl, real_q_arr):
-    loss = 0
-    if pl[1] < 0: pl[1] = 0
-    for i in range(30):
-        loss += np.sum(np.abs(np.histogram(real_q_arr, density=True,
-                                           bins=60)[0] - np.histogram(skewnorm.rvs(pl[2],
-                                           loc=pl[0], scale=pl[1], size=300), density=True, bins=60)[0]))
-    return loss/30
+    real_hist, _ = np.histogram(valid_q, bins=bins, density=True)
 
+    sim_distr = skewnorm.rvs(shape, loc=loc, scale=scale, size=max(5000, len(valid_q) * 5))
+    sim_distr = np.clip(sim_distr, 0, 40)  # Обрезка вне диапазона
 
-def parse_ano(ano_fname, ano_format):
-    inp_ano = pd.read_csv(ano_fname, sep=';', header=None,
-                          comment='#', usecols=[0, 1], names=['merged', 'parent'], dtype=np.str_)
-    inp_ano[['chr', 'ano_type', 'class', 'start', 'end', 'dot', 'strand', 'dot2', 'ID']] = inp_ano['merged'].str.split(
-        '\t', expand=True)
-    inp_ano.drop(['merged', 'ano_type', 'dot', 'dot2'], axis=1, inplace=True)
-    inp_ano[['start', 'end']] = inp_ano[['start', 'end']].astype(np.int32)
-    inp_ano['strand'] = inp_ano['strand'].astype('category')
-    inp_ano.drop(inp_ano[~inp_ano['class'].isin(['gene', 'exon', 'transcript'])].index, inplace=True)
+    sim_hist, _ = np.histogram(sim_distr, bins=bins, density=True)
 
-    if ano_format == 'gtf':
-        genes_ano = inp_ano[inp_ano['class'] == 'gene'].copy()
-        genes_ano.drop(['parent'], axis=1, inplace=True)
-        genes_ano['ENSG'] = genes_ano['ID'].apply(lambda x: x[9:-1])
-        genes_ano.drop(['ID'], axis=1, inplace=True)
-
-        exons = inp_ano[inp_ano['class'] == 'exon'].copy()
-        exons['ENSG'] = exons['ID'].apply(lambda x: x[9:-1])
-        exons.drop(['parent', 'ID'], axis=1, inplace=True)
-        exons.drop_duplicates(inplace=True)
-
-        tran_lens = inp_ano[inp_ano['class'] == 'transcript'].copy()
-        tran_lens['ENSG'] = tran_lens['ID'].apply(lambda x: x[9:-1])
-        tran_lens['ENST'] = tran_lens['parent'].apply(lambda x: x[16:-1])
-        tran_lens.drop(['parent', 'ID', 'chr', 'class', 'start', 'end', 'strand'], axis=1, inplace=True)
-        tran_lens = tran_lens.groupby(by='ENSG', as_index=False).agg(lambda x: list(x))
-
-        exons_df = inp_ano[inp_ano['class'] == 'exon'].copy()
-        exons_df['ENST'] = exons_df['parent'].apply(lambda x: x[16:-1])
-        exons_df['length'] = exons_df['end'] - exons_df['start']
-        exons_df.drop(['ID', 'chr', 'class', 'start', 'end', 'strand', 'parent'], axis=1, inplace=True)
-        exons_df = exons_df.groupby(by='ENST', as_index=False).sum()
-
-        dict_exons = dict(zip(exons_df['ENST'], exons_df['length']))
-        tran_lens['Length'] = tran_lens['ENST'].apply(lambda x: [dict_exons[i] for i in x])
-
-    elif ano_format == 'gff3':
-        genes_ano = inp_ano[inp_ano['class'] == 'gene'].copy()
-        genes_ano['ENSG'] = genes_ano['ID'].apply(lambda x: x[3:]).copy()
-        genes_ano.drop(['parent', 'ID'], axis=1, inplace=True)
-
-
-        tran_lens = inp_ano[inp_ano['class'] == 'transcript'].copy()
-        tran_lens['ENST'] = tran_lens['ID'].apply(lambda x: x[3:])
-        tran_lens['ENSG'] = tran_lens['parent'].apply(lambda x: x[7:])
-        tran_lens.drop(['parent', 'ID', 'chr', 'class', 'start', 'end', 'strand'], axis=1, inplace=True)
-
-        exons = inp_ano[inp_ano['class'] == 'exon'].copy()
-        exons['ENST'] = exons['parent'].apply(lambda x: x[7:])
-        exons.drop(['parent', 'ID'], axis=1, inplace=True)
-        exons.drop_duplicates(inplace=True)
-        tx2gen = dict(zip(tran_lens['ENST'], tran_lens['ENSG']))
-        exons['ENSG'] = exons['ENST'].apply(lambda x: tx2gen[x])
-
-        tran_lens = tran_lens.groupby(by='ENSG', as_index=False).agg(lambda x: list(x))
-
-        exons_df = inp_ano[inp_ano['class'] == 'exon'].copy()
-        exons_df['length'] = exons_df['end'] - exons_df['start']
-        exons_df['ID'] = exons_df['ID'].apply(lambda x: x[3:])
-        exons_df['parent'] = exons_df['parent'].apply(lambda x: x[7:])
-        exons_df.drop(['ID', 'chr', 'class', 'start', 'end', 'strand'], axis=1, inplace=True)
-        exons_df = exons_df.groupby(by='parent', as_index=False).sum()
-
-        dict_exons = dict(zip(exons_df['parent'], exons_df['length']))
-        tran_lens['Length'] = tran_lens['ENST'].apply(lambda x: [dict_exons[i] for i in x])
-
-    else:
-        genes_ano, tran_lens = None, None
-    del inp_ano
-
-    return genes_ano, tran_lens, exons
+    min_len = min(len(real_hist), len(sim_hist))
+    return np.mean(np.abs(real_hist[:min_len] - sim_hist[:min_len]))
